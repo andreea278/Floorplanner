@@ -8,7 +8,7 @@ export const mockFloorPlan: FloorPlan = {
     {
       id: 'wall-1',
       start: { x: 0, y: 0 },
-      end: { x: 6, y: 0 },
+      end: { x: 10, y: 0 },
       height: 2.7,
       thickness: 0.2,
     },

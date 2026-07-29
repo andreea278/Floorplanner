@@ -1,11 +1,18 @@
-<script setup lang="ts"></script>
+<script setup lang="ts">
+import ThreeViewer from './components/ThreeViewer.vue'
+import { mockFloorPlan } from './data/mockFloorPlan'
+</script>
 
 <template>
-  <h1>You did it!</h1>
-  <p>
-    Visit <a href="https://vuejs.org/" target="_blank" rel="noopener">vuejs.org</a> to read the
-    documentation
-  </p>
+  <main class="app">
+    <ThreeViewer :floor-plan="mockFloorPlan" />
+  </main>
 </template>
 
-<style scoped></style>
+<style scoped>
+.app {
+  width: 100vw;
+  height: 100vh;
+  margin: 0;
+}
+</style>
