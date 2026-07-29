@@ -1,0 +1,37 @@
+# Node / Vue
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Python - pentru mai târziu
+backend/.venv/
+backend/__pycache__/
+backend/**/*.pyc
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
