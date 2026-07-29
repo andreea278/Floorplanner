@@ -12,5 +12,8 @@ export interface Wall {
 }
 
 export interface FloorPlan {
+  id: string
+  name: string
+  unit: string
   walls: Wall[]
 }
