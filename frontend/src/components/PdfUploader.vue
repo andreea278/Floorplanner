@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import type { FloorPlan } from '@/types/floorPlan'
-import { detectFloorPlan, FloorPlanApiError } from '@/api/floorPlanApi'
+import { detectFloorPlan, FloorPlanApiError } from '@/services/floorPlanApi'
 
 const emit = defineEmits<{
   detected: [floorPlan: FloorPlan]
