@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import type { FloorPlan, Wall, Point2D } from '@/types/floorPlan'
 
 const props = defineProps<{ floorPlan: FloorPlan }>()
@@ -10,7 +10,8 @@ const emit = defineEmits<{
 
 // Local editable copy - we never mutate the prop directly (Vue best
 // practice: props flow one way, down). All edits happen here; the parent
-// only finds out when the user explicitly clicks "Generate 3D Model".
+// only finds out when we emit 'confirm' (bottom CTA or the quick 3D-view
+// toggle below both do this).
 //
 // Note: props.floorPlan is wrapped in a Vue reactive Proxy, and
 // structuredClone() throws DataCloneError on that - so we use a JSON
@@ -26,13 +27,20 @@ const PX_PER_UNIT = 60
 const PADDING = 40
 
 const bounds = computed(() => {
+  // No walls yet (blank start) - give the user a comfortable 10x8m area to
+  // draw on instead of a tiny 1x1 canvas.
+  if (walls.value.length === 0) {
+    return { minX: 0, minY: 0, maxX: 10, maxY: 8 }
+  }
+
   const xs = walls.value.flatMap((w) => [w.start.x, w.end.x])
   const ys = walls.value.flatMap((w) => [w.start.y, w.end.y])
-  const minX = Math.min(...xs, 0)
-  const minY = Math.min(...ys, 0)
-  const maxX = Math.max(...xs, 1)
-  const maxY = Math.max(...ys, 1)
-  return { minX, minY, maxX, maxY }
+  return {
+    minX: Math.min(...xs, 0),
+    minY: Math.min(...ys, 0),
+    maxX: Math.max(...xs, 1),
+    maxY: Math.max(...ys, 1),
+  }
 })
 
 const canvasWidth = computed(
@@ -55,6 +63,35 @@ function toPlanUnits(screenX: number, screenY: number): Point2D {
     y: (screenY - PADDING) / PX_PER_UNIT + bounds.value.minY,
   }
 }
+
+// --- Snapping ---
+// While adding or dragging a wall endpoint, if the point lands within this
+// many plan units (meters) of an existing wall's corner, snap to that exact
+// corner instead of the raw cursor position - so walls actually connect
+// with no gap, instead of needing a pixel-perfect click.
+const SNAP_DISTANCE = 0.35
+
+function findSnapTarget(point: Point2D, excludeWallId?: string): Point2D | null {
+  let closest: Point2D | null = null
+  let closestDist = SNAP_DISTANCE
+
+  for (const wall of walls.value) {
+    if (wall.id === excludeWallId) continue
+    for (const candidate of [wall.start, wall.end]) {
+      const dist = Math.hypot(candidate.x - point.x, candidate.y - point.y)
+      if (dist < closestDist) {
+        closestDist = dist
+        closest = candidate
+      }
+    }
+  }
+
+  return closest
+}
+
+// Live preview of the snap target while adding a wall, so the user can see
+// which corner they're about to lock onto before clicking.
+const snapPreview = ref<Point2D | null>(null)
 
 // --- Zoom ---
 // The SVG's *internal* coordinate system (viewBox) never changes - only
@@ -99,16 +136,42 @@ function toSvgSpace(event: PointerEvent | MouseEvent): { x: number; y: number } 
 }
 
 // --- Selection ---
-const selectedWallId = ref<string | null>(null)
+// A Set of wall ids so several walls can be selected at once (shift/ctrl/
+// cmd-click to toggle one in or out, or drag a marquee box over several).
+const selectedWallIds = ref<Set<string>>(new Set())
+const selectedCount = computed(() => selectedWallIds.value.size)
 
-function selectWall(id: string) {
-  selectedWallId.value = selectedWallId.value === id ? null : id
+function isSelected(id: string): boolean {
+  return selectedWallIds.value.has(id)
+}
+
+function selectWall(id: string, event: MouseEvent) {
+  const additive = event.shiftKey || event.metaKey || event.ctrlKey
+  const next = new Set(selectedWallIds.value)
+
+  if (additive) {
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+  } else {
+    next.clear()
+    next.add(id)
+  }
+
+  selectedWallIds.value = next
+}
+
+function selectAll() {
+  selectedWallIds.value = new Set(walls.value.map((w) => w.id))
+}
+
+function clearSelection() {
+  selectedWallIds.value = new Set()
 }
 
 function deleteSelected() {
-  if (!selectedWallId.value) return
-  walls.value = walls.value.filter((w) => w.id !== selectedWallId.value)
-  selectedWallId.value = null
+  if (selectedWallIds.value.size === 0) return
+  walls.value = walls.value.filter((w) => !selectedWallIds.value.has(w.id))
+  clearSelection()
 }
 
 // --- Dragging an endpoint ---
@@ -124,20 +187,107 @@ function startDrag(event: PointerEvent, wallId: string, end: 'start' | 'end') {
   ;(event.target as Element).setPointerCapture(event.pointerId)
 }
 
-function onPointerMove(event: PointerEvent) {
-  if (!dragging.value) return
-
-  const svgPoint = toSvgSpace(event)
-  const planPoint = toPlanUnits(svgPoint.x, svgPoint.y)
-
-  const wall = walls.value.find((w) => w.id === dragging.value!.wallId)
-  if (!wall) return
-
-  wall[dragging.value.end] = planPoint
-}
-
 function stopDrag() {
   dragging.value = null
+}
+
+// --- Marquee (rubber-band) selection ---
+// Dragging on empty canvas draws a selection box; any wall whose bounding
+// box overlaps it gets added to the selection on release.
+const marqueeStart = ref<{ x: number; y: number } | null>(null)
+const marqueeCurrent = ref<{ x: number; y: number } | null>(null)
+const isMarqueeSelecting = ref(false)
+
+function wallIntersectsRect(
+  wall: Wall,
+  rect: { minX: number; maxX: number; minY: number; maxY: number },
+): boolean {
+  const p1 = toScreen(wall.start)
+  const p2 = toScreen(wall.end)
+  const wallMinX = Math.min(p1.x, p2.x)
+  const wallMaxX = Math.max(p1.x, p2.x)
+  const wallMinY = Math.min(p1.y, p2.y)
+  const wallMaxY = Math.max(p1.y, p2.y)
+
+  return (
+    wallMinX <= rect.maxX &&
+    wallMaxX >= rect.minX &&
+    wallMinY <= rect.maxY &&
+    wallMaxY >= rect.minY
+  )
+}
+
+function finishMarqueeSelection() {
+  if (marqueeStart.value && marqueeCurrent.value) {
+    const rect = {
+      minX: Math.min(marqueeStart.value.x, marqueeCurrent.value.x),
+      maxX: Math.max(marqueeStart.value.x, marqueeCurrent.value.x),
+      minY: Math.min(marqueeStart.value.y, marqueeCurrent.value.y),
+      maxY: Math.max(marqueeStart.value.y, marqueeCurrent.value.y),
+    }
+
+    // Ignore near-zero drags - those are plain clicks on empty canvas
+    // (selection was already cleared, if appropriate, on pointerdown).
+    if (rect.maxX - rect.minX > 4 || rect.maxY - rect.minY > 4) {
+      const next = new Set(selectedWallIds.value)
+      for (const wall of walls.value) {
+        if (wallIntersectsRect(wall, rect)) next.add(wall.id)
+      }
+      selectedWallIds.value = next
+    }
+  }
+
+  marqueeStart.value = null
+  marqueeCurrent.value = null
+  isMarqueeSelecting.value = false
+}
+
+// --- Unified pointer handlers (endpoint drag + marquee select + snap preview) ---
+function onSvgPointerDown(event: PointerEvent) {
+  if (isAddingWall.value) return
+
+  const svgPoint = toSvgSpace(event)
+  marqueeStart.value = svgPoint
+  marqueeCurrent.value = svgPoint
+  isMarqueeSelecting.value = true
+
+  if (!(event.shiftKey || event.metaKey || event.ctrlKey)) {
+    selectedWallIds.value = new Set()
+  }
+}
+
+function onSvgPointerMove(event: PointerEvent) {
+  if (dragging.value) {
+    const svgPoint = toSvgSpace(event)
+    const rawPoint = toPlanUnits(svgPoint.x, svgPoint.y)
+    const planPoint = findSnapTarget(rawPoint, dragging.value.wallId) ?? rawPoint
+
+    const wall = walls.value.find((w) => w.id === dragging.value!.wallId)
+    if (wall) wall[dragging.value.end] = planPoint
+    return
+  }
+
+  if (isAddingWall.value) {
+    const svgPoint = toSvgSpace(event)
+    const rawPoint = toPlanUnits(svgPoint.x, svgPoint.y)
+    snapPreview.value = findSnapTarget(rawPoint)
+    return
+  }
+
+  if (isMarqueeSelecting.value) {
+    marqueeCurrent.value = toSvgSpace(event)
+  }
+}
+
+function onSvgPointerUp() {
+  if (dragging.value) {
+    stopDrag()
+    return
+  }
+
+  if (isMarqueeSelecting.value) {
+    finishMarqueeSelection()
+  }
 }
 
 // --- Adding a new wall: click two points on empty canvas ---
@@ -148,7 +298,8 @@ function onCanvasClick(event: MouseEvent) {
   if (!isAddingWall.value) return
 
   const svgPoint = toSvgSpace(event)
-  const planPoint = toPlanUnits(svgPoint.x, svgPoint.y)
+  const rawPoint = toPlanUnits(svgPoint.x, svgPoint.y)
+  const planPoint = findSnapTarget(rawPoint) ?? rawPoint
 
   if (!pendingStart.value) {
     pendingStart.value = planPoint
@@ -165,12 +316,34 @@ function onCanvasClick(event: MouseEvent) {
 
   pendingStart.value = null
   isAddingWall.value = false
+  snapPreview.value = null
 }
 
 function toggleAddWall() {
   isAddingWall.value = !isAddingWall.value
   pendingStart.value = null
+  snapPreview.value = null
 }
+
+// --- Keyboard shortcuts: Delete/Backspace to remove selection, Escape to
+// clear selection or cancel "add wall" mode ---
+function onKeyDown(event: KeyboardEvent) {
+  if ((event.key === 'Delete' || event.key === 'Backspace') && selectedWallIds.value.size > 0) {
+    event.preventDefault()
+    deleteSelected()
+  } else if (event.key === 'Escape') {
+    clearSelection()
+    if (isAddingWall.value) toggleAddWall()
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeyDown)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeyDown)
+})
 
 function confirmAndContinue() {
   emit('confirm', { ...props.floorPlan, walls: walls.value })
@@ -179,11 +352,15 @@ function confirmAndContinue() {
 
 <template>
   <div class="editor">
+    <button class="quick-3d-button" @click="confirmAndContinue">3D view →</button>
+
     <div class="toolbar">
       <p class="hint">
-        Drag the white dots to fix a wall's position. Click a wall to select
-        it (turns red), then delete if it shouldn't be there. Ctrl/Cmd +
-        scroll, or the buttons below, to zoom.
+        Click a wall to select it. Shift/Ctrl/Cmd-click to select several, or
+        drag on empty canvas for a selection box. Drag the white dots to
+        reposition an endpoint - new or moved endpoints snap to nearby wall
+        corners automatically. Delete/Backspace removes the selection,
+        Escape clears it. Ctrl/Cmd + scroll, or the buttons below, to zoom.
       </p>
       <div class="actions">
         <button
@@ -193,12 +370,15 @@ function confirmAndContinue() {
         >
           {{ isAddingWall ? 'Click two points…' : '+ Add wall' }}
         </button>
+        <button class="tool-button" :disabled="walls.length === 0" @click="selectAll">
+          Select all
+        </button>
         <button
           class="tool-button danger"
-          :disabled="!selectedWallId"
+          :disabled="selectedCount === 0"
           @click="deleteSelected"
         >
-          Delete selected
+          Delete selected{{ selectedCount > 0 ? ` (${selectedCount})` : '' }}
         </button>
         <span class="divider" />
         <button class="tool-button" @click="zoomOut">−</button>
@@ -210,6 +390,10 @@ function confirmAndContinue() {
     </div>
 
     <div class="canvas-wrapper" @wheel="onWheel">
+      <p v-if="walls.length === 0 && !isAddingWall" class="empty-hint">
+        Click "+ Add wall", then click two points on the canvas to draw your first wall.
+      </p>
+
       <svg
         ref="svgRef"
         :width="canvasWidth * zoom"
@@ -217,9 +401,10 @@ function confirmAndContinue() {
         :viewBox="`0 0 ${canvasWidth} ${canvasHeight}`"
         class="canvas"
         :class="{ 'add-mode': isAddingWall }"
-        @pointermove="onPointerMove"
-        @pointerup="stopDrag"
-        @pointercancel="stopDrag"
+        @pointerdown="onSvgPointerDown"
+        @pointermove="onSvgPointerMove"
+        @pointerup="onSvgPointerUp"
+        @pointercancel="onSvgPointerUp"
         @click="onCanvasClick"
       >
         <line
@@ -229,8 +414,8 @@ function confirmAndContinue() {
           :y1="toScreen(wall.start).y"
           :x2="toScreen(wall.end).x"
           :y2="toScreen(wall.end).y"
-          :class="['wall-line', { selected: wall.id === selectedWallId }]"
-          @click.stop="selectWall(wall.id)"
+          :class="['wall-line', { selected: isSelected(wall.id) }]"
+          @click.stop="selectWall(wall.id, $event)"
         />
 
         <template v-for="wall in walls" :key="wall.id + '-handles'">
@@ -257,6 +442,23 @@ function confirmAndContinue() {
           r="6"
           class="pending-point"
         />
+
+        <circle
+          v-if="isAddingWall && snapPreview"
+          :cx="toScreen(snapPreview).x"
+          :cy="toScreen(snapPreview).y"
+          r="12"
+          class="snap-indicator"
+        />
+
+        <rect
+          v-if="isMarqueeSelecting && marqueeStart && marqueeCurrent"
+          :x="Math.min(marqueeStart.x, marqueeCurrent.x)"
+          :y="Math.min(marqueeStart.y, marqueeCurrent.y)"
+          :width="Math.abs(marqueeCurrent.x - marqueeStart.x)"
+          :height="Math.abs(marqueeCurrent.y - marqueeStart.y)"
+          class="marquee"
+        />
       </svg>
     </div>
 
@@ -278,12 +480,29 @@ function confirmAndContinue() {
   box-sizing: border-box;
 }
 
+.quick-3d-button {
+  position: absolute;
+  top: 16px;
+  left: 160px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid #444;
+  background: #1c1c1e;
+  color: #e5e5e5;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.quick-3d-button:hover {
+  border-color: #6b8afd;
+}
+
 .toolbar {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 10px;
-  max-width: 560px;
+  max-width: 620px;
   text-align: center;
 }
 
@@ -342,12 +561,28 @@ function confirmAndContinue() {
 }
 
 .canvas-wrapper {
+  position: relative;
   max-width: 90vw;
   max-height: 60vh;
   overflow: auto;
   background: #16161a;
   border: 1px solid #2a2a2e;
   border-radius: 8px;
+}
+
+.empty-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  padding: 0 24px;
+  max-width: 260px;
+  text-align: center;
+  font-size: 13px;
+  color: #666;
+  pointer-events: none;
+  z-index: 1;
 }
 
 .canvas {
@@ -384,6 +619,21 @@ function confirmAndContinue() {
 
 .pending-point {
   fill: #ffd166;
+}
+
+.snap-indicator {
+  fill: none;
+  stroke: #ffd166;
+  stroke-width: 2;
+  pointer-events: none;
+}
+
+.marquee {
+  fill: rgba(107, 138, 253, 0.15);
+  stroke: #6b8afd;
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  pointer-events: none;
 }
 
 .continue-button {

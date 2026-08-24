@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { useWalkControls } from '@/composables/useWalkControls'
 import type { FloorPlan, Wall } from '@/types/floorPlan'
 
 const props = defineProps<{
@@ -14,7 +15,10 @@ let scene: THREE.Scene
 let camera: THREE.PerspectiveCamera
 let renderer: THREE.WebGLRenderer
 let controls: OrbitControls
+let walkControls: ReturnType<typeof useWalkControls>
 let animationFrameId = 0
+
+const clock = new THREE.Clock()
 
 const wallMeshes: THREE.Mesh[] = []
 
@@ -117,6 +121,8 @@ function handleResize() {
 function animate() {
   animationFrameId = requestAnimationFrame(animate)
 
+  const delta = clock.getDelta()
+  walkControls.update(delta)
   controls.update()
   renderer.render(scene, camera)
 }
@@ -148,6 +154,8 @@ onMounted(() => {
   controls.enableDamping = true
   controls.target.set(3, 1, 2)
 
+  walkControls = useWalkControls(camera, controls, { moveSpeed: 4 })
+
   createFloor()
   createGrid()
   createLights()
@@ -176,6 +184,7 @@ onUnmounted(() => {
 
   clearWalls()
 
+  walkControls?.dispose()
   controls?.dispose()
   renderer?.dispose()
 })

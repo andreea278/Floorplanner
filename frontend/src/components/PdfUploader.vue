@@ -72,10 +72,26 @@ async function handleFile(file: File) {
 
       <div v-if="isUploading" class="state">
         <div class="spinner" />
-        <p>Detecting walls…</p>
+        <p class="title">Detecting walls…</p>
       </div>
 
       <div v-else class="state">
+        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path
+            d="M12 16V4M12 4L7 9M12 4L17 9"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+          <path
+            d="M4 16V18C4 19.1046 4.89543 20 6 20H18C19.1046 20 20 19.1046 20 18V16"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
         <p class="title">Drop a floorplan here</p>
         <p class="subtitle">PDF, PNG, or JPEG — or click to browse</p>
       </div>
@@ -102,16 +118,18 @@ async function handleFile(file: File) {
   align-items: center;
   justify-content: center;
   border: 2px dashed #444;
-  border-radius: 12px;
+  border-radius: 14px;
   background: #1c1c1e;
   cursor: pointer;
   transition:
     border-color 0.15s ease,
-    background 0.15s ease;
+    background 0.15s ease,
+    transform 0.15s ease;
 }
 
 .dropzone:hover {
   border-color: #6b8afd;
+  transform: translateY(-1px);
 }
 
 .dropzone.dragging {
@@ -122,6 +140,7 @@ async function handleFile(file: File) {
 .dropzone.uploading {
   cursor: default;
   border-color: #444;
+  transform: none;
 }
 
 .hidden-input {
@@ -136,6 +155,13 @@ async function handleFile(file: File) {
   color: #e5e5e5;
   text-align: center;
   padding: 24px;
+}
+
+.upload-icon {
+  width: 30px;
+  height: 30px;
+  color: #6b8afd;
+  margin-bottom: 4px;
 }
 
 .title {
