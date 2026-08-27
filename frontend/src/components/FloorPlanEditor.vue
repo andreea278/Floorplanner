@@ -93,7 +93,70 @@ function findSnapTarget(point: Point2D, excludeWallId?: string): Point2D | null 
 // which corner they're about to lock onto before clicking.
 const snapPreview = ref<Point2D | null>(null)
 
-// --- Zoom ---
+// --- Calibration ---
+// Detection has no way to know real-world scale from pixels alone - the
+// backend just assumes 100px/meter, which is a guess, not a measurement.
+// This lets the user pick two points whose real-world distance they
+// actually know (e.g. a wall they measured, or a known door width),
+// type that distance in, and we rescale every wall's coordinates by the
+// correction factor. This only needs two points and one number - it
+// doesn't require going back to the original image.
+const isCalibrating = ref(false)
+const calibrationStart = ref<Point2D | null>(null)
+const calibrationEnd = ref<Point2D | null>(null)
+const measuredDistance = computed(() => {
+  if (!calibrationStart.value || !calibrationEnd.value) return 0
+  return Math.hypot(
+    calibrationEnd.value.x - calibrationStart.value.x,
+    calibrationEnd.value.y - calibrationStart.value.y,
+  )
+})
+const realDistanceInput = ref<number | null>(null)
+
+function toggleCalibrate() {
+  isCalibrating.value = !isCalibrating.value
+  calibrationStart.value = null
+  calibrationEnd.value = null
+  realDistanceInput.value = null
+  if (isCalibrating.value) {
+    isAddingWall.value = false
+    pendingStart.value = null
+    snapPreview.value = null
+  }
+}
+
+function onCalibrationClick(point: Point2D) {
+  if (!calibrationStart.value) {
+    calibrationStart.value = point
+  } else if (!calibrationEnd.value) {
+    calibrationEnd.value = point
+  }
+}
+
+function applyCalibration() {
+  if (!realDistanceInput.value || realDistanceInput.value <= 0 || measuredDistance.value === 0) {
+    return
+  }
+
+  const factor = realDistanceInput.value / measuredDistance.value
+
+  // Scale every coordinate uniformly - wall height/thickness are left
+  // alone (they're reasonable fixed defaults, not something calibration
+  // is meant to correct).
+  walls.value = walls.value.map((wall) => ({
+    ...wall,
+    start: { x: wall.start.x * factor, y: wall.start.y * factor },
+    end: { x: wall.end.x * factor, y: wall.end.y * factor },
+  }))
+
+  toggleCalibrate()
+}
+
+function cancelCalibration() {
+  toggleCalibrate()
+}
+
+
 // The SVG's *internal* coordinate system (viewBox) never changes - only
 // how many actual screen pixels that viewBox is displayed across. This
 // means all the plan-unit math above stays untouched; zoom only affects
@@ -244,7 +307,7 @@ function finishMarqueeSelection() {
 
 // --- Unified pointer handlers (endpoint drag + marquee select + snap preview) ---
 function onSvgPointerDown(event: PointerEvent) {
-  if (isAddingWall.value) return
+  if (isAddingWall.value || isCalibrating.value) return
 
   const svgPoint = toSvgSpace(event)
   marqueeStart.value = svgPoint
@@ -267,7 +330,7 @@ function onSvgPointerMove(event: PointerEvent) {
     return
   }
 
-  if (isAddingWall.value) {
+  if (isAddingWall.value || isCalibrating.value) {
     const svgPoint = toSvgSpace(event)
     const rawPoint = toPlanUnits(svgPoint.x, svgPoint.y)
     snapPreview.value = findSnapTarget(rawPoint)
@@ -295,11 +358,16 @@ const isAddingWall = ref(false)
 const pendingStart = ref<Point2D | null>(null)
 
 function onCanvasClick(event: MouseEvent) {
-  if (!isAddingWall.value) return
+  if (!isAddingWall.value && !isCalibrating.value) return
 
   const svgPoint = toSvgSpace(event)
   const rawPoint = toPlanUnits(svgPoint.x, svgPoint.y)
   const planPoint = findSnapTarget(rawPoint) ?? rawPoint
+
+  if (isCalibrating.value) {
+    onCalibrationClick(planPoint)
+    return
+  }
 
   if (!pendingStart.value) {
     pendingStart.value = planPoint
@@ -323,6 +391,11 @@ function toggleAddWall() {
   isAddingWall.value = !isAddingWall.value
   pendingStart.value = null
   snapPreview.value = null
+  if (isAddingWall.value) {
+    isCalibrating.value = false
+    calibrationStart.value = null
+    calibrationEnd.value = null
+  }
 }
 
 // --- Keyboard shortcuts: Delete/Backspace to remove selection, Escape to
@@ -334,6 +407,7 @@ function onKeyDown(event: KeyboardEvent) {
   } else if (event.key === 'Escape') {
     clearSelection()
     if (isAddingWall.value) toggleAddWall()
+    if (isCalibrating.value) toggleCalibrate()
   }
 }
 
@@ -370,6 +444,14 @@ function confirmAndContinue() {
         >
           {{ isAddingWall ? 'Click two points…' : '+ Add wall' }}
         </button>
+        <button
+          class="tool-button"
+          :class="{ active: isCalibrating }"
+          :disabled="walls.length === 0"
+          @click="toggleCalibrate"
+        >
+          📏 Calibrate
+        </button>
         <button class="tool-button" :disabled="walls.length === 0" @click="selectAll">
           Select all
         </button>
@@ -387,6 +469,35 @@ function confirmAndContinue() {
         </button>
         <button class="tool-button" @click="zoomIn">+</button>
       </div>
+
+      <div v-if="isCalibrating" class="calibration-panel">
+        <p v-if="!calibrationStart" class="calibration-step">
+          Click one end of something whose real length you know (a wall, a door).
+        </p>
+        <p v-else-if="!calibrationEnd" class="calibration-step">
+          Now click the other end.
+        </p>
+        <div v-else class="calibration-input">
+          <span>That's {{ measuredDistance.toFixed(2) }} plan units. Its real length is</span>
+          <input
+            v-model.number="realDistanceInput"
+            type="number"
+            step="0.01"
+            min="0"
+            placeholder="meters"
+            class="calibration-number"
+          />
+          <span>meters.</span>
+          <button
+            class="tool-button primary"
+            :disabled="!realDistanceInput || realDistanceInput <= 0"
+            @click="applyCalibration"
+          >
+            Apply
+          </button>
+          <button class="tool-button" @click="cancelCalibration">Cancel</button>
+        </div>
+      </div>
     </div>
 
     <div class="canvas-wrapper" @wheel="onWheel">
@@ -400,7 +511,7 @@ function confirmAndContinue() {
         :height="canvasHeight * zoom"
         :viewBox="`0 0 ${canvasWidth} ${canvasHeight}`"
         class="canvas"
-        :class="{ 'add-mode': isAddingWall }"
+        :class="{ 'add-mode': isAddingWall || isCalibrating }"
         @pointerdown="onSvgPointerDown"
         @pointermove="onSvgPointerMove"
         @pointerup="onSvgPointerUp"
@@ -450,6 +561,39 @@ function confirmAndContinue() {
           r="12"
           class="snap-indicator"
         />
+
+        <circle
+          v-if="isCalibrating && snapPreview"
+          :cx="toScreen(snapPreview).x"
+          :cy="toScreen(snapPreview).y"
+          r="12"
+          class="snap-indicator"
+        />
+
+        <template v-if="isCalibrating">
+          <line
+            v-if="calibrationStart && calibrationEnd"
+            :x1="toScreen(calibrationStart).x"
+            :y1="toScreen(calibrationStart).y"
+            :x2="toScreen(calibrationEnd).x"
+            :y2="toScreen(calibrationEnd).y"
+            class="calibration-line"
+          />
+          <circle
+            v-if="calibrationStart"
+            :cx="toScreen(calibrationStart).x"
+            :cy="toScreen(calibrationStart).y"
+            r="7"
+            class="calibration-point"
+          />
+          <circle
+            v-if="calibrationEnd"
+            :cx="toScreen(calibrationEnd).x"
+            :cy="toScreen(calibrationEnd).y"
+            r="7"
+            class="calibration-point"
+          />
+        </template>
 
         <rect
           v-if="isMarqueeSelecting && marqueeStart && marqueeCurrent"
@@ -615,6 +759,65 @@ function confirmAndContinue() {
 .handle:hover {
   fill: #6b8afd;
   stroke: #e5e5e5;
+}
+
+.calibration-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #1c1c1e;
+  border: 1px solid #ffd166;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.calibration-step {
+  margin: 0;
+  color: #ffd166;
+}
+
+.calibration-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: #ccc;
+}
+
+.calibration-number {
+  width: 80px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid #444;
+  background: #101012;
+  color: #e5e5e5;
+  font-size: 13px;
+}
+
+.tool-button.primary {
+  border-color: #6b8afd;
+  background: #6b8afd;
+  color: #0d0d0f;
+  font-weight: 600;
+}
+
+.tool-button.primary:hover:not(:disabled) {
+  background: #82a0ff;
+}
+
+.calibration-point {
+  fill: #ffd166;
+  stroke: #0d0d0f;
+  stroke-width: 2;
+}
+
+.calibration-line {
+  stroke: #ffd166;
+  stroke-width: 2;
+  stroke-dasharray: 5 4;
 }
 
 .pending-point {
