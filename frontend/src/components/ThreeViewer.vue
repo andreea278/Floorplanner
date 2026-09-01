@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { useWalkControls } from '@/composables/useWalkControls'
-import type { FloorPlan, Wall } from '@/types/floorPlan'
+import type { FloorPlan, Wall, Door, Window } from '@/types/floorPlan'
 
 const props = defineProps<{
   floorPlan: FloorPlan
@@ -20,57 +20,131 @@ let animationFrameId = 0
 
 const clock = new THREE.Clock()
 
-const wallMeshes: THREE.Mesh[] = []
+// Shared across every wall segment/pane - created once, disposed once on
+// unmount (not per-wall, since each wall is now built from several meshes
+// instead of a single box).
+const wallMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 })
+const glassMaterial = new THREE.MeshStandardMaterial({
+  color: 0xbcd8ff,
+  roughness: 0.1,
+  metalness: 0.1,
+  transparent: true,
+  opacity: 0.35,
+})
 
-function createWallMesh(wall: Wall): THREE.Mesh {
+const wallGroups: THREE.Group[] = []
+
+function addSolidSegment(
+  group: THREE.Group,
+  thickness: number,
+  localXStart: number,
+  localXEnd: number,
+  yStart: number,
+  yEnd: number,
+) {
+  const segLength = localXEnd - localXStart
+  const segHeight = yEnd - yStart
+  if (segLength <= 0.001 || segHeight <= 0.001) return
+
+  const geometry = new THREE.BoxGeometry(segLength, segHeight, thickness)
+  const mesh = new THREE.Mesh(geometry, wallMaterial)
+  mesh.position.set((localXStart + localXEnd) / 2, (yStart + yEnd) / 2, 0)
+  group.add(mesh)
+}
+
+// A wall is built as a Group, not a single Mesh: we slice it along its own
+// length (local X axis) into solid segments, leaving real gaps for doors
+// and windows instead of just drawing an opaque box through them.
+//   - doors: fully open from the floor up to door height, solid "lintel"
+//     segment above (if the wall is taller than the door).
+//   - windows: solid sill segment below, solid lintel above, and a thin
+//     semi-transparent glass pane filling the opening in between.
+function buildWallGroup(wall: Wall, doors: Door[], windows: Window[]): THREE.Group {
+  const group = new THREE.Group()
+
   const dx = wall.end.x - wall.start.x
   const dz = wall.end.y - wall.start.y
-
   const length = Math.hypot(dx, dz)
   const angle = Math.atan2(dz, dx)
 
-  const geometry = new THREE.BoxGeometry(length, wall.height, wall.thickness)
+  group.position.set((wall.start.x + wall.end.x) / 2, 0, (wall.start.y + wall.end.y) / 2)
+  group.rotation.y = -angle
 
-  const material = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    roughness: 0.6,
+  type Opening = (Door & { kind: 'door' }) | (Window & { kind: 'window' })
+  const openings: Opening[] = [
+    ...doors.filter((d) => d.wallId === wall.id).map((d) => ({ ...d, kind: 'door' as const })),
+    ...windows.filter((w) => w.wallId === wall.id).map((w) => ({ ...w, kind: 'window' as const })),
+  ].sort((a, b) => a.offset - b.offset)
+
+  let cursor = -length / 2 // walking along local X, from wall start to end
+
+  for (const opening of openings) {
+    const halfWidth = opening.width / 2
+    const openStart = Math.max(opening.offset - halfWidth - length / 2, -length / 2)
+    const openEnd = Math.min(opening.offset + halfWidth - length / 2, length / 2)
+    if (openEnd <= openStart) continue
+
+    // Solid segment from the previous cutout (or the wall start) up to this one
+    addSolidSegment(group, wall.thickness, cursor, openStart, 0, wall.height)
+
+    if (opening.kind === 'door') {
+      addSolidSegment(group, wall.thickness, openStart, openEnd, opening.height, wall.height)
+    } else {
+      addSolidSegment(group, wall.thickness, openStart, openEnd, 0, opening.sillHeight)
+      addSolidSegment(
+        group,
+        wall.thickness,
+        openStart,
+        openEnd,
+        opening.sillHeight + opening.height,
+        wall.height,
+      )
+
+      const paneGeometry = new THREE.BoxGeometry(
+        openEnd - openStart,
+        opening.height,
+        Math.max(wall.thickness * 0.3, 0.02),
+      )
+      const pane = new THREE.Mesh(paneGeometry, glassMaterial)
+      pane.position.set((openStart + openEnd) / 2, opening.sillHeight + opening.height / 2, 0)
+      group.add(pane)
+    }
+
+    cursor = openEnd
+  }
+
+  // Final solid segment from the last cutout (or the wall start, if there
+  // were no openings at all) to the wall end.
+  addSolidSegment(group, wall.thickness, cursor, length / 2, 0, wall.height)
+
+  return group
+}
+
+function disposeGroup(group: THREE.Group) {
+  group.traverse((child) => {
+    if (child instanceof THREE.Mesh) {
+      child.geometry.dispose()
+      // wallMaterial/glassMaterial are shared across every wall and are
+      // disposed once in onUnmounted, not per-segment here.
+    }
   })
-
-  const mesh = new THREE.Mesh(geometry, material)
-
-  mesh.position.set(
-    (wall.start.x + wall.end.x) / 2,
-    wall.height / 2,
-    (wall.start.y + wall.end.y) / 2,
-  )
-
-  mesh.rotation.y = -angle
-
-  return mesh
 }
 
 function clearWalls() {
-  for (const mesh of wallMeshes) {
-    scene.remove(mesh)
-    mesh.geometry.dispose()
-
-    if (Array.isArray(mesh.material)) {
-      mesh.material.forEach((material) => material.dispose())
-    } else {
-      mesh.material.dispose()
-    }
+  for (const group of wallGroups) {
+    scene.remove(group)
+    disposeGroup(group)
   }
-
-  wallMeshes.length = 0
+  wallGroups.length = 0
 }
 
 function renderWalls(floorPlan: FloorPlan) {
   clearWalls()
 
   for (const wall of floorPlan.walls) {
-    const wallMesh = createWallMesh(wall)
-    wallMeshes.push(wallMesh)
-    scene.add(wallMesh)
+    const group = buildWallGroup(wall, floorPlan.doors ?? [], floorPlan.windows ?? [])
+    wallGroups.push(group)
+    scene.add(group)
   }
 }
 
@@ -268,6 +342,8 @@ onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
 
   clearWalls()
+  wallMaterial.dispose()
+  glassMaterial.dispose()
   floorMesh?.geometry.dispose()
   floorMaterial.dispose()
   gridHelper?.dispose()

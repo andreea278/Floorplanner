@@ -23,6 +23,7 @@ async def detect_floorplan(
     default_wall_height: float = 2.7,
     default_wall_thickness: float = 0.2,
     page_number: int = 0,
+    min_wall_thickness_px: int = 8,
 ) -> FloorPlan:
     content = await file.read()
 
@@ -55,6 +56,7 @@ async def detect_floorplan(
         scale_px_per_unit=scale_px_per_unit,
         default_height=default_wall_height,
         default_thickness=default_wall_thickness,
+        min_wall_thickness_px=min_wall_thickness_px,
     )
 
     return FloorPlan(

@@ -22,13 +22,15 @@ function startBlank() {
     name: 'New Floor Plan',
     unit: 'meters',
     walls: [],
+    doors: [],
+    windows: [],
   }
 }
 
 // IMPORTANT: update BOTH refs. FloorPlanEditor re-reads its starting walls
 // from `detectedPlan` every time it mounts (including when we come back
 // from the 3D view), so if only `confirmedPlan` were updated here, going
-// "Back to 2D" would re-mount the editor with the original, pre-edit walls
+// "Back to 2D" would re-mount the editor with the original, pre-edit data
 // and silently discard everything drawn/edited so far.
 function onConfirmed(edited: FloorPlan) {
   detectedPlan.value = edited

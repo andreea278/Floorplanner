@@ -34,4 +34,23 @@ export const mockFloorPlan: FloorPlan = {
       thickness: 0.2,
     },
   ],
+  doors: [
+    {
+      id: 'door-1',
+      wallId: 'wall-1',
+      offset: 2,
+      width: 0.9,
+      height: 2.1,
+    },
+  ],
+  windows: [
+    {
+      id: 'window-1',
+      wallId: 'wall-1',
+      offset: 7,
+      width: 1.5,
+      height: 1.2,
+      sillHeight: 0.9,
+    },
+  ],
 }

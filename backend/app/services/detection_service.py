@@ -1,7 +1,7 @@
 """
 Wall detection pipeline.
 
-Image -> grayscale -> binarize -> line segments (Hough) -> merge into walls
+Image -> grayscale -> binarize (thickness-filtered) -> line segments (Hough) -> merge into walls
 
 This is deliberately "classical CV", not ML. It works well on clean,
 high-contrast architectural plans (straight black lines on white background).
@@ -35,8 +35,26 @@ class Segment:
         return math.hypot(self.x2 - self.x1, self.y2 - self.y1)
 
 
-def _binarize(gray: np.ndarray) -> np.ndarray:
-    """Turn a grayscale floorplan image into a clean black/white line image."""
+def _binarize(gray: np.ndarray, min_wall_thickness_px: int = 8) -> np.ndarray:
+    """Turn a grayscale floorplan image into a clean black/white line image
+    containing only wall-thickness strokes.
+
+    Real walls are drawn as thick, solid lines. Room labels, titles,
+    dimension text, and door/window symbols (arcs, tick marks) are all
+    much thinner strokes - without filtering those out, Hough happily fits
+    tiny "wall" segments to individual letters or symbol lines, which is
+    exactly what produced the phantom floating wall fragments seen above
+    real plans and inside rooms (room-label text, mostly).
+
+    We remove anything thinner than `min_wall_thickness_px` with a
+    morphological opening (erode then dilate) BEFORE closing gaps, so thin
+    content disappears entirely instead of surviving and then being
+    bridged into something that reads as wall-like. A blob only survives
+    the opening if it's at least `min_wall_thickness_px` wide in every
+    direction - text strokes and 1-2pt annotation lines are nowhere close
+    to that at typical scan/render resolutions (100-300 DPI), while walls
+    drawn several points thick comfortably are.
+    """
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
     # Otsu's threshold works well for plans that are basically black lines on
@@ -45,10 +63,17 @@ def _binarize(gray: np.ndarray) -> np.ndarray:
         blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    # Close small gaps in wall lines (broken by text, hatching, dimension
-    # marks, etc.) so Hough sees continuous segments.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    open_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (min_wall_thickness_px, min_wall_thickness_px)
+    )
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_kernel)
+
+    # Close small gaps in wall lines (broken by hatching, minor scan noise,
+    # etc.) so Hough sees continuous segments. This runs AFTER the opening
+    # step above, so it can only bridge gaps within already wall-thick
+    # strokes - it can't resurrect the thin text/symbols just removed.
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, close_kernel, iterations=2)
 
     return closed
 
@@ -103,15 +128,25 @@ def _merge_segments(
 
     Hough typically returns many short overlapping fragments for what is
     really one continuous wall. We group by orientation + offset from
-    origin (same as before), but now, within each offset-group, segments
-    are only joined together if the gap *along the wall's own length*
-    between them is small (max_bridge_gap_px) - a small gap is assumed to
-    be noise (text crossing the wall, a broken scan line) and gets
-    bridged; a larger gap is assumed to be a real opening (a doorway) and
-    is kept as two separate walls instead of being silently erased.
+    origin, then, within each offset-group, segments are only joined
+    together if the gap *along the wall's own length* between them is
+    small (max_bridge_gap_px) - a small gap is assumed to be noise (text
+    crossing the wall, a broken scan line) and gets bridged; a larger gap
+    is assumed to be a real opening (a doorway) and is kept as two
+    separate walls instead of being silently erased.
+
+    The offset-grouping itself uses CHAIN clustering: a new segment joins
+    a cluster if it's within `distance_tolerance_px` of the *last* segment
+    added to that cluster, not the first. A single thick wall stroke
+    produces Hough lines along BOTH of its edges (plus jitter between
+    them) - e.g. offsets 943, 944, ..., 958 for one ~15px-thick wall. Each
+    consecutive step in that chain is small, but the total span (943 to
+    958) can exceed the tolerance. Comparing only to the first element
+    would then split that single wall into two ("top edge" / "bottom
+    edge") - which is exactly the double-wall bug this fixes. Comparing to
+    the last element lets the whole chain merge into one wall instead.
     """
-    horizontals = [s for s in segments if s.angle_deg <
-                   45 or s.angle_deg > 135]
+    horizontals = [s for s in segments if s.angle_deg < 45 or s.angle_deg > 135]
     verticals = [s for s in segments if 45 <= s.angle_deg <= 135]
 
     def merge_group(group: list[Segment], is_horizontal: bool) -> list[Segment]:
@@ -122,7 +157,7 @@ def _merge_segments(
         offset_key = (lambda s: (s.y1 + s.y2) /
                       2) if is_horizontal else (lambda s: (s.x1 + s.x2) / 2)
         # position-along-the-wall key: x for horizontal, y for vertical -
-        # this is the axis we now check gap size along, before bridging.
+        # this is the axis we check gap size along, before bridging.
         along_min = (lambda s: min(s.x1, s.x2)) if is_horizontal else (
             lambda s: min(s.y1, s.y2))
         along_max = (lambda s: max(s.x1, s.x2)) if is_horizontal else (
@@ -134,7 +169,9 @@ def _merge_segments(
         for seg in group:
             placed = False
             for cluster in offset_clusters:
-                if abs(offset_key(seg) - offset_key(cluster[0])) <= distance_tolerance_px:
+                # Compare to the LAST segment added to this cluster (chain
+                # clustering), not the first - see the docstring above.
+                if abs(offset_key(seg) - offset_key(cluster[-1])) <= distance_tolerance_px:
                     cluster.append(seg)
                     placed = True
                     break
@@ -144,11 +181,11 @@ def _merge_segments(
         merged: list[Segment] = []
 
         for cluster in offset_clusters:
-            # Within this same-offset cluster (e.g. "all segments at
-            # roughly x=900"), sort by position along the wall, then walk
-            # through and only bridge consecutive segments whose gap is
-            # small. A gap bigger than max_bridge_gap_px starts a new,
-            # separate wall run instead of being absorbed.
+            # Within this same-offset cluster (e.g. "all segments between
+            # roughly y=943 and y=958"), sort by position along the wall,
+            # then walk through and only bridge consecutive segments whose
+            # gap is small. A gap bigger than max_bridge_gap_px starts a
+            # new, separate wall run instead of being absorbed.
             cluster = sorted(cluster, key=along_min)
             runs: list[list[Segment]] = []
 
@@ -180,6 +217,7 @@ def detect_walls(
     min_wall_length_px: float = 25.0,
     default_height: float = 2.7,
     default_thickness: float = 0.2,
+    min_wall_thickness_px: int = 8,
 ) -> list[dict]:
     """
     Detect walls in a floorplan image.
@@ -194,6 +232,12 @@ def detect_walls(
         default_height / default_thickness: 2D plans give no info on wall
             height, so we assume a standard interior wall until the user
             edits it in the 2D editor.
+        min_wall_thickness_px: strokes thinner than this (in the rendered
+            image) are discarded before line detection even runs - this is
+            what keeps room labels, titles, dimension text, and door/window
+            symbols from being mistaken for walls. Raise it if thin real
+            walls are getting eaten; lower it if bold/large text is still
+            leaking through as phantom walls.
 
     Returns:
         list of dicts matching the frontend `Wall` type
@@ -202,7 +246,7 @@ def detect_walls(
     gray = cv2.cvtColor(
         image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
 
-    binary = _binarize(gray)
+    binary = _binarize(gray, min_wall_thickness_px=min_wall_thickness_px)
     raw_segments = _detect_raw_segments(binary)
     snapped = [_snap_to_axis(s) for s in raw_segments]
     merged = _merge_segments(snapped)
