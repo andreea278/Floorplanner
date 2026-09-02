@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Literal
 from pydantic import BaseModel, Field
 
 
@@ -13,13 +14,11 @@ class Wall(BaseModel):
     end: Point2D
     height: float
     thickness: float
+    color: str | None = None
 
 
 class Door(BaseModel):
     id: str
-    # Deliberately camelCase (not snake_case) to match the JSON wire format
-    # already used everywhere in this file (start/end/height/thickness),
-    # without needing Pydantic field aliases.
     wallId: str
     offset: float = Field(ge=0)
     width: float = Field(default=0.9, gt=0)
@@ -35,6 +34,15 @@ class Window(BaseModel):
     sillHeight: float = Field(default=0.9, ge=0)
 
 
+class Furniture(BaseModel):
+    id: str
+    kind: Literal["sofa", "bed", "table", "chair", "toilet", "sink", "bathtub", "stove", "fridge"]
+    x: float
+    y: float
+    rotation: float = 0.0
+    color: str | None = None
+
+
 class FloorPlan(BaseModel):
     id: str
     name: str
@@ -42,6 +50,7 @@ class FloorPlan(BaseModel):
     walls: list[Wall]
     doors: list[Door] = []
     windows: list[Window] = []
+    furniture: list[Furniture] = []
 
 
 class DetectionOptions(BaseModel):

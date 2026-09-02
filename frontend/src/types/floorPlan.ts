@@ -9,12 +9,14 @@ export interface Wall {
   end: Point2D
   height: number
   thickness: number
+  /** Custom color override (hex, e.g. '#ff8844'). Falls back to the
+   * default look when unset. */
+  color?: string
 }
 
 export interface Door {
   id: string
   wallId: string
-  /** Distance in meters from the wall's start point to the door's center. */
   offset: number
   width: number
   height: number
@@ -23,12 +25,31 @@ export interface Door {
 export interface Window {
   id: string
   wallId: string
-  /** Distance in meters from the wall's start point to the window's center. */
   offset: number
   width: number
   height: number
-  /** Height of the window sill above the floor, in meters. */
   sillHeight: number
+}
+
+export type FurnitureKind =
+  | 'sofa'
+  | 'bed'
+  | 'table'
+  | 'chair'
+  | 'toilet'
+  | 'sink'
+  | 'bathtub'
+  | 'stove'
+  | 'fridge'
+
+export interface FurnitureItem {
+  id: string
+  kind: FurnitureKind
+  x: number
+  y: number
+  rotation: number
+  /** Custom color override (hex). Falls back to the kind's default material. */
+  color?: string
 }
 
 export interface FloorPlan {
@@ -38,4 +59,5 @@ export interface FloorPlan {
   walls: Wall[]
   doors: Door[]
   windows: Window[]
+  furniture: FurnitureItem[]
 }

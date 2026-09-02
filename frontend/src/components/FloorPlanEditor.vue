@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import type { FloorPlan, Wall, Door, Window, Point2D } from '@/types/floorPlan'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import type { FloorPlan, Wall, Door, Window, FurnitureItem, Point2D } from '@/types/floorPlan'
+import { findRoomAreas } from '@/composables/useRoomAreas'
+import { useUndoStack } from '@/composables/useUndoStack'
 
 const props = defineProps<{ floorPlan: FloorPlan }>()
 
@@ -8,30 +10,41 @@ const emit = defineEmits<{
   confirm: [floorPlan: FloorPlan]
 }>()
 
-// Local editable copies - we never mutate the prop directly (Vue best
-// practice: props flow one way, down). All edits happen here; the parent
-// only finds out when we emit 'confirm' (bottom CTA or the quick 3D-view
-// toggle below both do this).
-//
-// Note: props.floorPlan is wrapped in a Vue reactive Proxy, and
-// structuredClone() throws DataCloneError on that - so we use a JSON
-// round-trip instead, which is safe here since the data is plain
-// numbers/strings with no functions or special types. `?? []` guards
-// against an older/partial plan object that predates doors/windows.
 const walls = ref<Wall[]>(JSON.parse(JSON.stringify(props.floorPlan.walls)))
 const doors = ref<Door[]>(JSON.parse(JSON.stringify(props.floorPlan.doors ?? [])))
 const windows = ref<Window[]>(JSON.parse(JSON.stringify(props.floorPlan.windows ?? [])))
+const furniture = ref<FurnitureItem[]>(JSON.parse(JSON.stringify(props.floorPlan.furniture ?? [])))
+
+// --- Undo ---
+interface Snapshot {
+  walls: Wall[]
+  doors: Door[]
+  windows: Window[]
+}
+const undoStack = useUndoStack<Snapshot>()
+
+function pushUndoSnapshot() {
+  undoStack.push({
+    walls: JSON.parse(JSON.stringify(walls.value)),
+    doors: JSON.parse(JSON.stringify(doors.value)),
+    windows: JSON.parse(JSON.stringify(windows.value)),
+  })
+}
+
+function undo() {
+  const snapshot = undoStack.undo()
+  if (!snapshot) return
+  walls.value = snapshot.walls
+  doors.value = snapshot.doors
+  windows.value = snapshot.windows
+  clearSelection()
+}
 
 // --- Display scale: plan units (meters) -> SVG coordinate space ---
-// These are the SVG's own internal coordinates (the viewBox), separate
-// from how many actual screen pixels it's displayed at - that separation
-// is what makes zoom possible below.
 const PX_PER_UNIT = 60
 const PADDING = 40
 
 const bounds = computed(() => {
-  // No walls yet (blank start) - give the user a comfortable 10x8m area to
-  // draw on instead of a tiny 1x1 canvas.
   if (walls.value.length === 0) {
     return { minX: 0, minY: 0, maxX: 10, maxY: 8 }
   }
@@ -71,154 +84,8 @@ function wallById(id: string): Wall | undefined {
   return walls.value.find((w) => w.id === id)
 }
 
-// --- Snapping (for drawing/dragging wall endpoints, and for calibration
-// clicks - snapping to a real corner gives a more accurate measurement
-// than a freehand click) ---
-const SNAP_DISTANCE = 0.35
-
-function findSnapTarget(point: Point2D, excludeWallId?: string): Point2D | null {
-  let closest: Point2D | null = null
-  let closestDist = SNAP_DISTANCE
-
-  for (const wall of walls.value) {
-    if (wall.id === excludeWallId) continue
-    for (const candidate of [wall.start, wall.end]) {
-      const dist = Math.hypot(candidate.x - point.x, candidate.y - point.y)
-      if (dist < closestDist) {
-        closestDist = dist
-        closest = candidate
-      }
-    }
-  }
-
-  return closest
-}
-
-// Live preview of the snap target while adding a wall or calibrating, so
-// the user can see which corner they're about to lock onto before clicking.
-const snapPreview = ref<Point2D | null>(null)
-
-// --- Calibration ---
-// Detection has no way to know real-world scale from pixels alone - the
-// backend just assumes 100px/meter, which is a guess, not a measurement.
-// This lets the user pick two points whose real-world distance they
-// actually know (e.g. a wall they measured, or a known door width),
-// type that distance in, and we rescale every wall's coordinates by the
-// correction factor. This only needs two points and one number - it
-// doesn't require going back to the original image.
-const isCalibrating = ref(false)
-const calibrationStart = ref<Point2D | null>(null)
-const calibrationEnd = ref<Point2D | null>(null)
-const measuredDistance = computed(() => {
-  if (!calibrationStart.value || !calibrationEnd.value) return 0
-  return Math.hypot(
-    calibrationEnd.value.x - calibrationStart.value.x,
-    calibrationEnd.value.y - calibrationStart.value.y,
-  )
-})
-const realDistanceInput = ref<number | null>(null)
-
-function toggleCalibrate() {
-  isCalibrating.value = !isCalibrating.value
-  calibrationStart.value = null
-  calibrationEnd.value = null
-  realDistanceInput.value = null
-  if (isCalibrating.value) {
-    // Calibration and "add wall/door/window" are mutually exclusive - one
-    // click stream can't mean two different things at once.
-    addMode.value = null
-    pendingStart.value = null
-    snapPreview.value = null
-  }
-}
-
-function onCalibrationClick(point: Point2D) {
-  if (!calibrationStart.value) {
-    calibrationStart.value = point
-  } else if (!calibrationEnd.value) {
-    calibrationEnd.value = point
-  }
-}
-
-function applyCalibration() {
-  if (!realDistanceInput.value || realDistanceInput.value <= 0 || measuredDistance.value === 0) {
-    return
-  }
-
-  const factor = realDistanceInput.value / measuredDistance.value
-
-  // Scale every wall coordinate uniformly - height/thickness are left
-  // alone (they're reasonable fixed defaults, not something calibration
-  // is meant to correct).
-  walls.value = walls.value.map((wall) => ({
-    ...wall,
-    start: { x: wall.start.x * factor, y: wall.start.y * factor },
-    end: { x: wall.end.x * factor, y: wall.end.y * factor },
-  }))
-
-  // Door/window offsets are a distance along their wall, in the same units
-  // as the wall coordinates just rescaled above - without this they'd
-  // stay at their old, pre-calibration offset and visually drift off their
-  // wall once its length changes. Width/height/sillHeight are real
-  // physical measurements the user set directly (or left at sensible
-  // defaults), not something derived from the uncalibrated coordinates,
-  // so those are left untouched.
-  doors.value = doors.value.map((door) => ({ ...door, offset: door.offset * factor }))
-  windows.value = windows.value.map((win) => ({ ...win, offset: win.offset * factor }))
-
-  toggleCalibrate()
-}
-
-function cancelCalibration() {
-  toggleCalibrate()
-}
-
-// --- Zoom ---
-// The SVG's *internal* coordinate system (viewBox) never changes - only
-// how many actual screen pixels that viewBox is displayed across. This
-// means all the plan-unit math above stays untouched; zoom only affects
-// the `width`/`height` attributes, and we correct for it when reading
-// pointer positions back out (see toSvgSpace below).
-const zoom = ref(1)
-const MIN_ZOOM = 0.3
-const MAX_ZOOM = 3
-
-function zoomIn() {
-  zoom.value = Math.min(MAX_ZOOM, +(zoom.value + 0.25).toFixed(2))
-}
-function zoomOut() {
-  zoom.value = Math.max(MIN_ZOOM, +(zoom.value - 0.25).toFixed(2))
-}
-function zoomReset() {
-  zoom.value = 1
-}
-
-function onWheel(event: WheelEvent) {
-  // Ctrl/Cmd + scroll = zoom (matches the trackpad-pinch gesture browsers
-  // translate into a ctrlKey wheel event). Plain scroll still pans via the
-  // wrapper's native overflow scrolling - we don't intercept that.
-  if (!event.ctrlKey && !event.metaKey) return
-  event.preventDefault()
-  if (event.deltaY < 0) zoomIn()
-  else zoomOut()
-}
-
-// Convert a raw pointer event into the SVG's internal coordinate space,
-// accounting for both the CSS zoom and the wrapper's scroll offset.
-function toSvgSpace(event: PointerEvent | MouseEvent): { x: number; y: number } {
-  const rect = svgRef.value!.getBoundingClientRect()
-  const scaleX = canvasWidth.value / rect.width
-  const scaleY = canvasHeight.value / rect.height
-  return {
-    x: (event.clientX - rect.left) * scaleX,
-    y: (event.clientY - rect.top) * scaleY,
-  }
-}
-
-// --- Selection ---
-// A Set of ids so several walls/doors/windows can be selected at once
-// (shift/ctrl/cmd-click to toggle one in or out, or drag a marquee box
-// over several). Ids are unique across all three kinds.
+// --- Selection (declared before anything that reads it - e.g. the wall
+// color section below, which watches selectedIds) ---
 const selectedIds = ref<Set<string>>(new Set())
 const selectedCount = computed(() => selectedIds.value.size)
 
@@ -255,13 +122,12 @@ function clearSelection() {
 
 function deleteSelected() {
   if (selectedIds.value.size === 0) return
+  pushUndoSnapshot()
 
   const remainingWalls = walls.value.filter((w) => !selectedIds.value.has(w.id))
   const remainingWallIds = new Set(remainingWalls.map((w) => w.id))
 
   walls.value = remainingWalls
-  // A door/window also disappears if it was selected directly, OR if its
-  // wall just got deleted (no orphaned openings pointing at a missing wall).
   doors.value = doors.value.filter(
     (d) => !selectedIds.value.has(d.id) && remainingWallIds.has(d.wallId),
   )
@@ -272,16 +138,179 @@ function deleteSelected() {
   clearSelection()
 }
 
+// --- Wall color (depends on selectedIds above) ---
+const DEFAULT_WALL_COLOR = '#6b8afd'
+const wallColorPicker = ref(DEFAULT_WALL_COLOR)
+
+const selectedWallIds = computed(() =>
+  Array.from(selectedIds.value).filter((id) => walls.value.some((w) => w.id === id)),
+)
+
+function wallStrokeColor(wall: Wall): string {
+  if (isSelected(wall.id)) return '#ff6b6b'
+  return wall.color ?? DEFAULT_WALL_COLOR
+}
+
+function applyWallColor() {
+  if (selectedWallIds.value.length === 0) return
+  pushUndoSnapshot()
+  const idSet = new Set(selectedWallIds.value)
+  const color = wallColorPicker.value
+  walls.value = walls.value.map((w) => (idSet.has(w.id) ? { ...w, color } : w))
+}
+
+watch(selectedIds, () => {
+  const firstWallId = selectedWallIds.value[0]
+  if (!firstWallId) return
+  const wall = wallById(firstWallId)
+  wallColorPicker.value = wall?.color ?? DEFAULT_WALL_COLOR
+})
+
+// --- Measurements: wall length labels + room area labels -----------------
+const showMeasurements = ref(true)
+const showRoomAreas = ref(true)
+
+function wallLength(wall: Wall): number {
+  return Math.hypot(wall.end.x - wall.start.x, wall.end.y - wall.start.y)
+}
+
+function wallLabelPosition(wall: Wall) {
+  const p1 = toScreen(wall.start)
+  const p2 = toScreen(wall.end)
+  const mx = (p1.x + p2.x) / 2
+  const my = (p1.y + p2.y) / 2
+  const dx = p2.x - p1.x
+  const dy = p2.y - p1.y
+  const len = Math.hypot(dx, dy) || 1
+  const px = -dy / len
+  const py = dx / len
+  const offset = 14
+  return { x: mx + px * offset, y: my + py * offset }
+}
+
+const roomAreas = computed(() => (showRoomAreas.value ? findRoomAreas(walls.value) : []))
+
+// --- Snapping ---
+const SNAP_DISTANCE = 0.35
+
+function findSnapTarget(point: Point2D, excludeWallId?: string): Point2D | null {
+  let closest: Point2D | null = null
+  let closestDist = SNAP_DISTANCE
+
+  for (const wall of walls.value) {
+    if (wall.id === excludeWallId) continue
+    for (const candidate of [wall.start, wall.end]) {
+      const dist = Math.hypot(candidate.x - point.x, candidate.y - point.y)
+      if (dist < closestDist) {
+        closestDist = dist
+        closest = candidate
+      }
+    }
+  }
+
+  return closest
+}
+
+const snapPreview = ref<Point2D | null>(null)
+
+// --- Calibration ---
+const isCalibrating = ref(false)
+const calibrationStart = ref<Point2D | null>(null)
+const calibrationEnd = ref<Point2D | null>(null)
+const measuredDistance = computed(() => {
+  if (!calibrationStart.value || !calibrationEnd.value) return 0
+  return Math.hypot(
+    calibrationEnd.value.x - calibrationStart.value.x,
+    calibrationEnd.value.y - calibrationStart.value.y,
+  )
+})
+const realDistanceInput = ref<number | null>(null)
+
+function toggleCalibrate() {
+  isCalibrating.value = !isCalibrating.value
+  calibrationStart.value = null
+  calibrationEnd.value = null
+  realDistanceInput.value = null
+  if (isCalibrating.value) {
+    addMode.value = null
+    pendingStart.value = null
+    snapPreview.value = null
+  }
+}
+
+function onCalibrationClick(point: Point2D) {
+  if (!calibrationStart.value) {
+    calibrationStart.value = point
+  } else if (!calibrationEnd.value) {
+    calibrationEnd.value = point
+  }
+}
+
+function applyCalibration() {
+  if (!realDistanceInput.value || realDistanceInput.value <= 0 || measuredDistance.value === 0) {
+    return
+  }
+
+  pushUndoSnapshot()
+
+  const factor = realDistanceInput.value / measuredDistance.value
+
+  walls.value = walls.value.map((wall) => ({
+    ...wall,
+    start: { x: wall.start.x * factor, y: wall.start.y * factor },
+    end: { x: wall.end.x * factor, y: wall.end.y * factor },
+  }))
+
+  doors.value = doors.value.map((door) => ({ ...door, offset: door.offset * factor }))
+  windows.value = windows.value.map((win) => ({ ...win, offset: win.offset * factor }))
+  furniture.value = furniture.value.map((f) => ({ ...f, x: f.x * factor, y: f.y * factor }))
+
+  toggleCalibrate()
+}
+
+function cancelCalibration() {
+  toggleCalibrate()
+}
+
+// --- Zoom ---
+const zoom = ref(1)
+const MIN_ZOOM = 0.3
+const MAX_ZOOM = 3
+
+function zoomIn() {
+  zoom.value = Math.min(MAX_ZOOM, +(zoom.value + 0.25).toFixed(2))
+}
+function zoomOut() {
+  zoom.value = Math.max(MIN_ZOOM, +(zoom.value - 0.25).toFixed(2))
+}
+function zoomReset() {
+  zoom.value = 1
+}
+
+function onWheel(event: WheelEvent) {
+  if (!event.ctrlKey && !event.metaKey) return
+  event.preventDefault()
+  if (event.deltaY < 0) zoomIn()
+  else zoomOut()
+}
+
+function toSvgSpace(event: PointerEvent | MouseEvent): { x: number; y: number } {
+  const rect = svgRef.value!.getBoundingClientRect()
+  const scaleX = canvasWidth.value / rect.width
+  const scaleY = canvasHeight.value / rect.height
+  return {
+    x: (event.clientX - rect.left) * scaleX,
+    y: (event.clientY - rect.top) * scaleY,
+  }
+}
+
 // --- Dragging a wall endpoint ---
 const dragging = ref<{ wallId: string; end: 'start' | 'end' } | null>(null)
 const svgRef = ref<SVGSVGElement | null>(null)
 
 function startDrag(event: PointerEvent, wallId: string, end: 'start' | 'end') {
+  pushUndoSnapshot()
   dragging.value = { wallId, end }
-  // Pointer capture keeps sending pointermove/pointerup events to this
-  // element even if the cursor moves faster than the handle can visually
-  // keep up and briefly leaves it - without this, fast drags feel "sticky"
-  // or drop the drag entirely, especially noticeable on a trackpad.
   ;(event.target as Element).setPointerCapture(event.pointerId)
 }
 
@@ -289,8 +318,6 @@ function stopDrag() {
   dragging.value = null
 }
 
-// If a wall gets shorter than the doors/windows placed on it, pull their
-// offsets back in so they can't end up hanging past the new wall end.
 function clampOpeningsForWall(wallId: string) {
   const wall = wallById(wallId)
   if (!wall) return
@@ -307,13 +334,12 @@ function clampOpeningsForWall(wallId: string) {
 const draggingOpening = ref<{ id: string; kind: 'door' | 'window' } | null>(null)
 
 function startDragOpening(event: PointerEvent, id: string, kind: 'door' | 'window') {
+  pushUndoSnapshot()
   draggingOpening.value = { id, kind }
   ;(event.target as Element).setPointerCapture(event.pointerId)
 }
 
 // --- Marquee (rubber-band) selection ---
-// Dragging on empty canvas draws a selection box; any wall/door/window
-// whose span overlaps it gets added to the selection on release.
 const marqueeStart = ref<{ x: number; y: number } | null>(null)
 const marqueeCurrent = ref<{ x: number; y: number } | null>(null)
 const isMarqueeSelecting = ref(false)
@@ -361,8 +387,6 @@ function finishMarqueeSelection() {
       maxY: Math.max(marqueeStart.value.y, marqueeCurrent.value.y),
     }
 
-    // Ignore near-zero drags - those are plain clicks on empty canvas
-    // (selection was already cleared, if appropriate, on pointerdown).
     if (rect.maxX - rect.minX > 4 || rect.maxY - rect.minY > 4) {
       const next = new Set(selectedIds.value)
 
@@ -393,7 +417,7 @@ function finishMarqueeSelection() {
   isMarqueeSelecting.value = false
 }
 
-// --- Unified pointer handlers (endpoint drag, opening drag, marquee, snap) ---
+// --- Unified pointer handlers ---
 function onSvgPointerDown(event: PointerEvent) {
   if (addMode.value !== null || isCalibrating.value) return
 
@@ -471,7 +495,6 @@ function onSvgPointerUp() {
 
 // --- Add mode: 'wall' | 'door' | 'window' | null ---
 const addMode = ref<'wall' | 'door' | 'window' | null>(null)
-const isAddingWall = computed(() => addMode.value === 'wall')
 const pendingStart = ref<Point2D | null>(null)
 
 function toggleMode(mode: 'wall' | 'door' | 'window') {
@@ -479,14 +502,13 @@ function toggleMode(mode: 'wall' | 'door' | 'window') {
   pendingStart.value = null
   snapPreview.value = null
   if (addMode.value !== null) {
-    // Adding geometry and calibrating are mutually exclusive.
     isCalibrating.value = false
     calibrationStart.value = null
     calibrationEnd.value = null
   }
 }
 
-const WALL_HIT_DISTANCE = 0.4 // meters - how close a click needs to land to "count" as being on a wall
+const WALL_HIT_DISTANCE = 0.4
 
 function findWallProjection(
   point: Point2D,
@@ -516,6 +538,8 @@ function findWallProjection(
 }
 
 function addOpening(kind: 'door' | 'window', wallId: string, rawOffset: number, length: number) {
+  pushUndoSnapshot()
+
   const defaultWidth = kind === 'door' ? 0.9 : 1.2
   const halfWidth = Math.min(defaultWidth / 2, Math.max(length / 2 - 0.01, 0))
   const offset = Math.min(Math.max(rawOffset, halfWidth), Math.max(halfWidth, length - halfWidth))
@@ -542,9 +566,6 @@ function addOpening(kind: 'door' | 'window', wallId: string, rawOffset: number, 
   addMode.value = null
 }
 
-// Clicking directly on a wall handles three cases: calibrating (register
-// the calibration point), placing a door/window (most precise path since
-// we already know exactly which wall was hit), or plain selection.
 function onWallClick(wall: Wall, event: MouseEvent) {
   if (isCalibrating.value) {
     const svgPoint = toSvgSpace(event)
@@ -573,7 +594,6 @@ function onWallClick(wall: Wall, event: MouseEvent) {
   }
 }
 
-// Clicking near (but not exactly on) a wall's thin line, or on empty canvas.
 function onCanvasClick(event: MouseEvent) {
   if (addMode.value === null && !isCalibrating.value) return
 
@@ -594,6 +614,8 @@ function onCanvasClick(event: MouseEvent) {
       return
     }
 
+    pushUndoSnapshot()
+
     walls.value.push({
       id: `wall-${crypto.randomUUID().slice(0, 8)}`,
       start: pendingStart.value,
@@ -607,13 +629,18 @@ function onCanvasClick(event: MouseEvent) {
     snapPreview.value = null
   } else if (addMode.value === 'door' || addMode.value === 'window') {
     const hit = findWallProjection(rawPoint)
-    if (!hit) return // not close enough to any wall - ignore
+    if (!hit) return
     addOpening(addMode.value, hit.wallId, hit.offset, hit.wallLength)
   }
 }
 
 // --- Keyboard shortcuts ---
 function onKeyDown(event: KeyboardEvent) {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+    event.preventDefault()
+    undo()
+    return
+  }
   if ((event.key === 'Delete' || event.key === 'Backspace') && selectedIds.value.size > 0) {
     event.preventDefault()
     deleteSelected()
@@ -640,6 +667,7 @@ function confirmAndContinue() {
     walls: walls.value,
     doors: doors.value,
     windows: windows.value,
+    furniture: furniture.value,
   })
 }
 </script>
@@ -651,10 +679,10 @@ function confirmAndContinue() {
     <div class="toolbar">
       <p class="hint">
         Click a wall/door/window to select it. Shift/Ctrl/Cmd-click to select
-        several, or drag on empty canvas for a selection box. Drag the dots to
-        reposition - new or moved wall endpoints snap to nearby corners.
-        Delete/Backspace removes the selection, Escape clears it/cancels the
-        current tool. Ctrl/Cmd + scroll, or the buttons below, to zoom.
+        several, or drag on empty canvas for a selection box. Delete/Backspace
+        removes the selection, Ctrl/Cmd+Z undoes, Escape clears
+        selection/cancels the current tool. Ctrl/Cmd + scroll, or the buttons
+        below, to zoom.
       </p>
 
       <div class="legend">
@@ -664,6 +692,8 @@ function confirmAndContinue() {
       </div>
 
       <div class="actions">
+        <button class="tool-button" :disabled="!undoStack.canUndo()" @click="undo">↶ Undo</button>
+        <span class="divider" />
         <button class="tool-button" :class="{ active: addMode === 'wall' }" @click="toggleMode('wall')">
           {{ addMode === 'wall' ? 'Click two points…' : '+ Add wall' }}
         </button>
@@ -696,6 +726,22 @@ function confirmAndContinue() {
         </button>
         <button class="tool-button danger" :disabled="selectedCount === 0" @click="deleteSelected">
           Delete selected{{ selectedCount > 0 ? ` (${selectedCount})` : '' }}
+        </button>
+        <span class="divider" />
+        <input
+          type="color"
+          v-model="wallColorPicker"
+          @change="applyWallColor"
+          class="color-input"
+          :disabled="selectedWallIds.length === 0"
+          title="Wall color"
+        />
+        <span class="divider" />
+        <button class="tool-button" :class="{ active: showMeasurements }" @click="showMeasurements = !showMeasurements">
+          📏 Measurements
+        </button>
+        <button class="tool-button" :class="{ active: showRoomAreas }" @click="showRoomAreas = !showRoomAreas">
+          ▦ Room areas
         </button>
         <span class="divider" />
         <button class="tool-button" @click="zoomOut">−</button>
@@ -757,7 +803,8 @@ function confirmAndContinue() {
           :y1="toScreen(wall.start).y"
           :x2="toScreen(wall.end).x"
           :y2="toScreen(wall.end).y"
-          :class="['wall-line', { selected: isSelected(wall.id) }]"
+          :stroke="wallStrokeColor(wall)"
+          class="wall-line"
           @click.stop="onWallClick(wall, $event)"
         />
 
@@ -818,6 +865,28 @@ function confirmAndContinue() {
             class="handle"
             @pointerdown.stop="(e) => startDrag(e, wall.id, 'end')"
           />
+        </template>
+
+        <template v-if="showMeasurements">
+          <text
+            v-for="wall in walls"
+            :key="wall.id + '-label'"
+            :x="wallLabelPosition(wall).x"
+            :y="wallLabelPosition(wall).y"
+            class="dimension-label"
+            text-anchor="middle"
+          >{{ wallLength(wall).toFixed(2) }} m</text>
+        </template>
+
+        <template v-if="showRoomAreas">
+          <text
+            v-for="(room, idx) in roomAreas"
+            :key="'room-' + idx"
+            :x="toScreen(room.centroid).x"
+            :y="toScreen(room.centroid).y"
+            class="room-area-label"
+            text-anchor="middle"
+          >{{ room.areaM2.toFixed(1) }} m²</text>
         </template>
 
         <circle v-if="pendingStart" :cx="toScreen(pendingStart).x" :cy="toScreen(pendingStart).y" r="6" class="pending-point" />
@@ -904,7 +973,7 @@ function confirmAndContinue() {
   flex-direction: column;
   align-items: center;
   gap: 10px;
-  max-width: 680px;
+  max-width: 760px;
   text-align: center;
 }
 
@@ -1005,6 +1074,21 @@ function confirmAndContinue() {
   background: #82a0ff;
 }
 
+.color-input {
+  width: 32px;
+  height: 28px;
+  padding: 2px;
+  border-radius: 6px;
+  border: 1px solid #444;
+  background: #1c1c1e;
+  cursor: pointer;
+}
+
+.color-input:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .canvas-wrapper {
   position: relative;
   max-width: 90vw;
@@ -1040,7 +1124,6 @@ function confirmAndContinue() {
 }
 
 .wall-line {
-  stroke: #6b8afd;
   stroke-width: 4;
   cursor: pointer;
 }
@@ -1057,7 +1140,6 @@ function confirmAndContinue() {
   cursor: pointer;
 }
 
-.wall-line.selected,
 .door-span.selected,
 .window-span.selected {
   stroke: #ff6b6b;
@@ -1089,6 +1171,27 @@ function confirmAndContinue() {
 
 .window-handle {
   fill: #7fd0e8;
+}
+
+.dimension-label {
+  font-size: 11px;
+  fill: #ffd166;
+  stroke: #101012;
+  stroke-width: 3;
+  paint-order: stroke;
+  pointer-events: none;
+  user-select: none;
+}
+
+.room-area-label {
+  font-size: 13px;
+  font-weight: 600;
+  fill: #7fd0e8;
+  stroke: #101012;
+  stroke-width: 4;
+  paint-order: stroke;
+  pointer-events: none;
+  user-select: none;
 }
 
 .calibration-panel {

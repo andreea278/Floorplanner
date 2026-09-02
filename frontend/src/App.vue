@@ -5,10 +5,6 @@ import PdfUploader from './components/PdfUploader.vue'
 import FloorPlanEditor from './components/FloorPlanEditor.vue'
 import type { FloorPlan } from '@/types/floorPlan'
 
-// Three stages, one flag each - only one is ever true at a time:
-//   1. detectedPlan === null                -> show the uploader
-//   2. detectedPlan set, confirmedPlan null  -> show the 2D editor
-//   3. confirmedPlan set                     -> show the 3D viewer
 const detectedPlan = ref<FloorPlan | null>(null)
 const confirmedPlan = ref<FloorPlan | null>(null)
 
@@ -24,17 +20,19 @@ function startBlank() {
     walls: [],
     doors: [],
     windows: [],
+    furniture: [],
   }
 }
 
-// IMPORTANT: update BOTH refs. FloorPlanEditor re-reads its starting walls
-// from `detectedPlan` every time it mounts (including when we come back
-// from the 3D view), so if only `confirmedPlan` were updated here, going
-// "Back to 2D" would re-mount the editor with the original, pre-edit data
-// and silently discard everything drawn/edited so far.
-function onConfirmed(edited: FloorPlan) {
-  detectedPlan.value = edited
-  confirmedPlan.value = edited
+// IMPORTANT: update BOTH refs whenever the plan changes, from ANY source
+// (2D confirm, or a 3D edit) - FloorPlanEditor/ThreeViewer both re-read
+// their starting data from `detectedPlan` every time they mount, so if
+// only `confirmedPlan` were updated, switching views would re-mount the
+// other one with stale data and silently discard whatever was just
+// edited (walls in 2D, or doors/windows/furniture added in 3D).
+function syncPlan(updated: FloorPlan) {
+  detectedPlan.value = updated
+  confirmedPlan.value = updated
 }
 
 function reset() {
@@ -75,12 +73,12 @@ function backTo2D() {
     </div>
 
     <div v-else-if="!confirmedPlan" class="review-screen">
-      <FloorPlanEditor :floor-plan="detectedPlan" @confirm="onConfirmed" />
+      <FloorPlanEditor :floor-plan="detectedPlan" @confirm="syncPlan" />
       <button class="reset-button" @click="reset">Start over</button>
     </div>
 
     <template v-else>
-      <ThreeViewer :floor-plan="confirmedPlan" />
+      <ThreeViewer :floor-plan="confirmedPlan" @update="syncPlan" />
       <button class="reset-button" @click="backTo2D">← Back to 2D</button>
       <button class="reset-button secondary" @click="reset">Upload another plan</button>
     </template>
