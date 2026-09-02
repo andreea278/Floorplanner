@@ -51,12 +51,35 @@ const bounds = computed(() => {
 
   const xs = walls.value.flatMap((w) => [w.start.x, w.end.x])
   const ys = walls.value.flatMap((w) => [w.start.y, w.end.y])
-  return {
-    minX: Math.min(...xs, 0),
-    minY: Math.min(...ys, 0),
-    maxX: Math.max(...xs, 1),
-    maxY: Math.max(...ys, 1),
+
+  let minX = Math.min(...xs)
+  let minY = Math.min(...ys)
+  let maxX = Math.max(...xs)
+  let maxY = Math.max(...ys)
+
+  // Fit tightly to the actual content (no forced anchor to the origin -
+  // a plan detected from a PDF can easily sit far from (0,0) because of
+  // page margins, and forcing minX/minY down to 0 used to leave a huge
+  // blank gap before the drawing, which is what made it look like it
+  // "started from the bottom" until you scrolled). But also never let
+  // the working area shrink below a comfortable minimum - drawing a
+  // single small wall would otherwise snap the whole canvas down to
+  // just barely fit it, which feels like the canvas jumping underneath
+  // you. Padding is added symmetrically so small content stays centered.
+  const MIN_WIDTH = 10
+  const MIN_HEIGHT = 8
+  if (maxX - minX < MIN_WIDTH) {
+    const pad = (MIN_WIDTH - (maxX - minX)) / 2
+    minX -= pad
+    maxX += pad
   }
+  if (maxY - minY < MIN_HEIGHT) {
+    const pad = (MIN_HEIGHT - (maxY - minY)) / 2
+    minY -= pad
+    maxY += pad
+  }
+
+  return { minX, minY, maxX, maxY }
 })
 
 const canvasWidth = computed(

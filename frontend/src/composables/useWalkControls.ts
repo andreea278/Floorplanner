@@ -1,6 +1,5 @@
 import { ref } from 'vue'
 import * as THREE from 'three'
-import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 
 export interface UseWalkControlsOptions {
   /** Ground movement speed, in scene units (meters) per second. */
@@ -31,15 +30,13 @@ const KEY_BINDINGS: Record<string, keyof MoveState> = {
 }
 
 /**
- * WASD (+ Space/Shift) free movement layered on top of an existing
- * OrbitControls instance. Mouse-drag rotate and wheel zoom stay owned by
- * OrbitControls untouched - this only translates the camera and its orbit
- * target together, so orbiting always pivots around wherever you currently
- * are instead of the original fixed point.
+ * WASD (+ Space/Shift) movement that translates the camera along its own
+ * current facing direction - orientation itself is owned entirely by
+ * useFirstPersonLook (or, in orbit mode, by OrbitControls); this
+ * composable only ever moves camera.position, never rotates anything.
  */
 export function useWalkControls(
   camera: THREE.PerspectiveCamera,
-  orbitControls: OrbitControls,
   options: UseWalkControlsOptions = {},
 ) {
   const moveSpeed = options.moveSpeed ?? 4
@@ -63,7 +60,7 @@ export function useWalkControls(
   function onKeyDown(event: KeyboardEvent) {
     const action = KEY_BINDINGS[event.code]
     if (!action) return
-    event.preventDefault() // stop Space from scrolling the page, etc.
+    event.preventDefault()
     move[action] = true
     syncIsMoving()
   }
@@ -75,8 +72,6 @@ export function useWalkControls(
     syncIsMoving()
   }
 
-  // If the window loses focus mid-keypress (alt-tab, devtools, etc.) there's
-  // no matching keyup - without this the camera could drift forever.
   function onBlur() {
     ;(Object.keys(move) as (keyof MoveState)[]).forEach((key) => {
       move[key] = false
@@ -91,7 +86,6 @@ export function useWalkControls(
   const right = new THREE.Vector3()
   const back = new THREE.Vector3()
   const offset = new THREE.Vector3()
-  const vertical = new THREE.Vector3()
 
   function update(delta: number) {
     if (!isMoving.value) return
@@ -100,8 +94,9 @@ export function useWalkControls(
     right.setFromMatrixColumn(camera.matrixWorld, 0)
     back.setFromMatrixColumn(camera.matrixWorld, 2)
 
-    // Flatten to the horizontal plane so WASD feels like walking even while
-    // looking up/down - altitude is handled explicitly via Space/Shift.
+    // Flatten to the horizontal plane so WASD feels like walking even
+    // while looking up/down - altitude is handled explicitly via
+    // Space/Shift.
     right.y = 0
     back.y = 0
     right.normalize()
@@ -116,14 +111,10 @@ export function useWalkControls(
     if (offset.lengthSq() > 0) {
       offset.normalize().multiplyScalar(moveSpeed * delta)
       camera.position.add(offset)
-      orbitControls.target.add(offset)
     }
 
     if (move.up || move.down) {
-      const step = moveSpeed * delta * ((move.up ? 1 : 0) - (move.down ? 1 : 0))
-      vertical.set(0, step, 0)
-      camera.position.add(vertical)
-      orbitControls.target.add(vertical)
+      camera.position.y += moveSpeed * delta * ((move.up ? 1 : 0) - (move.down ? 1 : 0))
     }
   }
 

@@ -25,9 +25,6 @@ let animationFrameId = 0
 
 const clock = new THREE.Clock()
 
-// Walls are now locally editable too (color), same pattern as
-// doors/windows/furniture below - all four get synced from props on
-// mount/external change, and pushed back up via 'update' after any edit.
 const walls = ref<Wall[]>(JSON.parse(JSON.stringify(props.floorPlan.walls)))
 const doors = ref<Door[]>(JSON.parse(JSON.stringify(props.floorPlan.doors ?? [])))
 const windows = ref<Window[]>(JSON.parse(JSON.stringify(props.floorPlan.windows ?? [])))
@@ -78,8 +75,6 @@ function undo() {
   rebuildAndEmit()
 }
 
-// Shared across every wall segment/pane without a custom color - created
-// once, disposed once on unmount.
 const wallMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 })
 const glassMaterial = new THREE.MeshStandardMaterial({
   color: 0xbcd8ff,
@@ -317,10 +312,7 @@ function renderFurniture() {
   updateSelectionHelper()
 }
 
-// --- Selection: either a furniture piece OR a wall, mutually exclusive.
-// Declared here (all together) before anything below that watches them -
-// referencing a ref inside `watch(...)` before its declaration crashes
-// the whole component (learned that one the hard way). ---
+// --- Selection: either a furniture piece OR a wall ---
 const selectedFurnitureId = ref<string | null>(null)
 const selectedWallId = ref<string | null>(null)
 const DEFAULT_FURNITURE_COLOR = '#ffffff'
@@ -387,8 +379,8 @@ function rotateSelected(deltaRad: number) {
 type EditMode = 'door' | 'window' | FurnitureKind | null
 const editMode = ref<EditMode>(null)
 
-function toggleEditMode(mode: Exclude<EditMode, null>) {
-  editMode.value = editMode.value === mode ? null : mode
+function toggleEditMode(editModeKind: Exclude<EditMode, null>) {
+  editMode.value = editMode.value === editModeKind ? null : editModeKind
   selectedFurnitureId.value = null
   selectedWallId.value = null
   updateSelectionHelper()
@@ -459,60 +451,109 @@ function furnitureMeshesFlat(): THREE.Object3D[] {
   return all
 }
 
-// --- Raycasting + click-vs-drag ---
+// --- First-person look: hold the mouse button down and drag to rotate the
+// camera in place (pure yaw/pitch, no orbit target/radius) - no special
+// "click to engage" gate, no Pointer Lock, no Esc needed to leave it.
+// Releasing the button simply stops rotating, same as letting go of the
+// wheel in a car. Only active in walk mode - orbit mode keeps its normal
+// OrbitControls drag-to-orbit behavior untouched. ---
+const LOOK_SENSITIVITY = 0.0035
+const MIN_PITCH = -Math.PI / 2 + 0.05
+const MAX_PITCH = Math.PI / 2 - 0.05
+let yaw = 0
+let pitch = 0
+let isLookDragging = false
+let lastLookPos: { x: number; y: number } | null = null
+
+function syncYawPitchFromCamera() {
+  const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ')
+  yaw = euler.y
+  pitch = euler.x
+}
+
+function applyLookDelta(dx: number, dy: number) {
+  yaw -= dx * LOOK_SENSITIVITY
+  pitch -= dy * LOOK_SENSITIVITY
+  pitch = Math.min(MAX_PITCH, Math.max(MIN_PITCH, pitch))
+  camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'))
+}
+
+// --- Raycasting + click-vs-drag for placing/selecting things. The cursor
+// is always visible now (no Pointer Lock), so aiming just uses the real
+// cursor position. ---
 const raycaster = new THREE.Raycaster()
-const pointerNdc = new THREE.Vector2()
 let pointerDownPos: { x: number; y: number } | null = null
 let draggingFurnitureId: string | null = null
 const CLICK_MOVE_THRESHOLD = 6
 
-function updatePointerNdc(event: PointerEvent) {
+function computeRaycastNdc(event: PointerEvent): THREE.Vector2 {
   const rect = renderer.domElement.getBoundingClientRect()
-  pointerNdc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-  pointerNdc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+  return new THREE.Vector2(
+    ((event.clientX - rect.left) / rect.width) * 2 - 1,
+    -((event.clientY - rect.top) / rect.height) * 2 + 1,
+  )
 }
 
 function onDomPointerDown(event: PointerEvent) {
   pointerDownPos = { x: event.clientX, y: event.clientY }
 
+  // Dragging the ALREADY-selected furniture piece moves it - this check
+  // takes priority over starting a look-drag.
   if (!editMode.value && selectedFurnitureId.value) {
-    updatePointerNdc(event)
-    raycaster.setFromCamera(pointerNdc, camera)
+    raycaster.setFromCamera(computeRaycastNdc(event), camera)
     const hits = raycaster.intersectObjects(furnitureMeshesFlat(), false)
     if (hits.length > 0 && hits[0]!.object.userData.furnitureId === selectedFurnitureId.value) {
       pushUndoSnapshot()
       draggingFurnitureId = selectedFurnitureId.value
       controls.enabled = false
+      ;(event.target as Element).setPointerCapture(event.pointerId)
+      return
     }
+  }
+
+  if (mode.value === 'walk') {
+    syncYawPitchFromCamera()
+    isLookDragging = true
+    lastLookPos = { x: event.clientX, y: event.clientY }
+    ;(event.target as Element).setPointerCapture(event.pointerId)
   }
 }
 
 function onDomPointerMove(event: PointerEvent) {
-  if (!draggingFurnitureId) return
-  updatePointerNdc(event)
-  raycaster.setFromCamera(pointerNdc, camera)
-  const hits = raycaster.intersectObject(floorMesh, false)
-  if (hits.length === 0) return
-  const item = furniture.value.find((f) => f.id === draggingFurnitureId)
-  if (!item) return
-  item.x = hits[0]!.point.x
-  item.y = hits[0]!.point.z
-  renderFurniture()
+  if (draggingFurnitureId) {
+    raycaster.setFromCamera(computeRaycastNdc(event), camera)
+    const hits = raycaster.intersectObject(floorMesh, false)
+    if (hits.length === 0) return
+    const item = furniture.value.find((f) => f.id === draggingFurnitureId)
+    if (!item) return
+    item.x = hits[0]!.point.x
+    item.y = hits[0]!.point.z
+    renderFurniture()
+    return
+  }
+
+  if (isLookDragging && lastLookPos) {
+    applyLookDelta(event.clientX - lastLookPos.x, event.clientY - lastLookPos.y)
+    lastLookPos = { x: event.clientX, y: event.clientY }
+  }
 }
 
 function onDomPointerUp(event: PointerEvent) {
   if (draggingFurnitureId) {
     draggingFurnitureId = null
-    controls.enabled = true
+    controls.enabled = mode.value === 'orbit'
     pointerDownPos = null
     rebuildAndEmit()
     return
   }
 
+  isLookDragging = false
+  lastLookPos = null
+
   if (!pointerDownPos) return
   const moved = Math.hypot(event.clientX - pointerDownPos.x, event.clientY - pointerDownPos.y)
   pointerDownPos = null
-  if (moved > CLICK_MOVE_THRESHOLD) return
+  if (moved > CLICK_MOVE_THRESHOLD) return // was a look-drag, not a click
   handleEditClick(event)
 }
 
@@ -522,8 +563,7 @@ function handleEditClick(event: PointerEvent) {
     return
   }
 
-  updatePointerNdc(event)
-  raycaster.setFromCamera(pointerNdc, camera)
+  raycaster.setFromCamera(computeRaycastNdc(event), camera)
 
   if (editMode.value === 'door' || editMode.value === 'window') {
     const hits = raycaster.intersectObjects(wallHitMeshes, false)
@@ -551,12 +591,8 @@ function handleEditClick(event: PointerEvent) {
   }
 }
 
-// Click on empty canvas / a furniture piece / a wall - selects whichever
-// was hit (furniture takes priority if both happen to be under the same
-// pixel), or clears selection if neither was hit.
 function trySelectItem(event: PointerEvent) {
-  updatePointerNdc(event)
-  raycaster.setFromCamera(pointerNdc, camera)
+  raycaster.setFromCamera(computeRaycastNdc(event), camera)
 
   const furnitureHits = raycaster.intersectObjects(furnitureMeshesFlat(), false)
   if (furnitureHits.length > 0) {
@@ -625,6 +661,7 @@ function frameCameraToPlan(floorPlan: FloorPlan) {
   camera.near = Math.max(distance / 1000, 0.01)
   camera.far = distance * 100
   camera.updateProjectionMatrix()
+  camera.lookAt(controls.target)
   controls.update()
 }
 
@@ -702,7 +739,18 @@ function handleResize() {
 const mode = ref<'orbit' | 'walk'>('orbit')
 
 function toggleMode() {
-  mode.value = mode.value === 'orbit' ? 'walk' : 'orbit'
+  if (mode.value === 'orbit') {
+    mode.value = 'walk'
+    controls.enabled = false
+    syncYawPitchFromCamera()
+  } else {
+    mode.value = 'orbit'
+    const forward = new THREE.Vector3()
+    camera.getWorldDirection(forward)
+    controls.target.copy(camera.position).addScaledVector(forward, 5)
+    controls.enabled = true
+    controls.update()
+  }
 }
 
 function animate() {
@@ -711,8 +759,9 @@ function animate() {
   const delta = clock.getDelta()
   if (mode.value === 'walk') {
     walkControls.update(delta)
+  } else {
+    controls.update()
   }
-  controls.update()
   renderer.render(scene, camera)
 }
 
@@ -747,7 +796,7 @@ onMounted(() => {
   controls.maxDistance = 500
   controls.rotateSpeed = 0.4
 
-  walkControls = useWalkControls(camera, controls, { moveSpeed: 4 })
+  walkControls = useWalkControls(camera, { moveSpeed: 4 })
 
   createFloor()
   createGrid()
@@ -815,7 +864,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="containerRef" class="three-viewer">
+  <div ref="containerRef" class="three-viewer" :class="{ 'walk-cursor': mode === 'walk' }">
     <div class="edit-toolbar">
       <button class="tool-button" :disabled="!undoStack.canUndo()" @click="undo">↶ Undo</button>
       <span class="edit-divider" />
@@ -888,7 +937,7 @@ onUnmounted(() => {
     <button class="mode-toggle" @click="toggleMode">
       {{ mode === 'orbit' ? '🖱 Orbit mode' : '🚶 Walk mode' }}
     </button>
-    <p v-if="mode === 'walk'" class="mode-hint">WASD to move · Space/Shift for up/down</p>
+    <p v-if="mode === 'walk'" class="mode-hint">WASD to move · drag to look around · Space/Shift for up/down</p>
   </div>
 </template>
 
@@ -900,11 +949,19 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
+.three-viewer.walk-cursor {
+  cursor: grab;
+}
+
+.three-viewer.walk-cursor:active {
+  cursor: grabbing;
+}
+
 .edit-toolbar {
   position: absolute;
   top: 16px;
   right: 16px;
-  z-index: 10;
+  z-index: 20;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -970,7 +1027,7 @@ onUnmounted(() => {
   position: absolute;
   bottom: 16px;
   right: 16px;
-  z-index: 10;
+  z-index: 20;
   padding: 8px 14px;
   border-radius: 8px;
   border: 1px solid #444;
@@ -989,7 +1046,7 @@ onUnmounted(() => {
   position: absolute;
   bottom: 54px;
   right: 16px;
-  z-index: 10;
+  z-index: 20;
   margin: 0;
   padding: 4px 10px;
   border-radius: 6px;
