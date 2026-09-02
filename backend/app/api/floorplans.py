@@ -7,7 +7,7 @@ import numpy as np
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.models.floorplan import FloorPlan
-from app.services.detection_service import detect_walls
+from app.services.detection_service import detect_floorplan_elements
 from app.services.pdf_service import pdf_bytes_to_image
 
 router = APIRouter(prefix="/api/floorplan", tags=["floorplan"])
@@ -24,6 +24,7 @@ async def detect_floorplan(
     default_wall_thickness: float = 0.2,
     page_number: int = 0,
     min_wall_thickness_px: int = 8,
+    max_opening_width_units: float = 3.0,
 ) -> FloorPlan:
     content = await file.read()
 
@@ -51,19 +52,22 @@ async def detect_floorplan(
             "Upload a PDF, PNG, or JPEG.",
         )
 
-    walls = detect_walls(
+    result = detect_floorplan_elements(
         image,
         scale_px_per_unit=scale_px_per_unit,
         default_height=default_wall_height,
         default_thickness=default_wall_thickness,
         min_wall_thickness_px=min_wall_thickness_px,
+        max_opening_width_units=max_opening_width_units,
     )
 
     return FloorPlan(
         id=f"floorplan-{uuid.uuid4().hex[:8]}",
         name=file.filename or "Detected Floor Plan",
         unit="meters",
-        walls=walls,
+        walls=result.walls,
+        doors=result.doors,
+        windows=result.windows,
     )
 
 
